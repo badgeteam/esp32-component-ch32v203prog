@@ -1,0 +1,11 @@
+idf_component_register(
+    SRCS
+        "src/rvswd.c"
+        "src/ch32v203prog.c"
+    INCLUDE_DIRS
+        "include"
+    EMBED_FILES
+        "ch32_firmware.bin"
+    REQUIRES
+        "driver"
+)

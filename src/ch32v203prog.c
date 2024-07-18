@@ -1,0 +1,473 @@
+
+#include "esp_log.h"
+#include "rvswd.h"
+#include "string.h"
+
+static char const TAG[] = "ch32test";
+
+extern void draw_text(char const *text);
+
+extern uint8_t const ch32_firmware_start[] asm("_binary_ch32_firmware_bin_start");
+extern uint8_t const ch32_firmware_end[] asm("_binary_ch32_firmware_bin_end");
+
+
+#define CH32_REG_DEBUG_DATA0        0x04 // Data register 0, can be used for temporary storage of data
+#define CH32_REG_DEBUG_DATA1        0x05 // Data register 1, can be used for temporary storage of data
+#define CH32_REG_DEBUG_DMCONTROL    0x10 // Debug module control register
+#define CH32_REG_DEBUG_DMSTATUS     0x11 // Debug module status register
+#define CH32_REG_DEBUG_HARTINFO     0x12 // Microprocessor status register
+#define CH32_REG_DEBUG_ABSTRACTCS   0x16 // Abstract command status register
+#define CH32_REG_DEBUG_COMMAND      0x17 // Astract command register
+#define CH32_REG_DEBUG_ABSTRACTAUTO 0x18 // Abstract command auto-executtion
+#define CH32_REG_DEBUG_PROGBUF0     0x20 // Instruction cache register 0
+#define CH32_REG_DEBUG_PROGBUF1     0x21 // Instruction cache register 1
+#define CH32_REG_DEBUG_PROGBUF2     0x22 // Instruction cache register 2
+#define CH32_REG_DEBUG_PROGBUF3     0x23 // Instruction cache register 3
+#define CH32_REG_DEBUG_PROGBUF4     0x24 // Instruction cache register 4
+#define CH32_REG_DEBUG_PROGBUF5     0x25 // Instruction cache register 5
+#define CH32_REG_DEBUG_PROGBUF6     0x26 // Instruction cache register 6
+#define CH32_REG_DEBUG_PROGBUF7     0x27 // Instruction cache register 7
+#define CH32_REG_DEBUG_HALTSUM0     0x40 // Halt status register
+#define CH32_REG_DEBUG_CPBR         0x7C // Capability register
+#define CH32_REG_DEBUG_CFGR         0x7D // Configuration register
+#define CH32_REG_DEBUG_SHDWCFGR     0x7E // Shadow configuration register
+
+#define CH32_REGS_CSR 0x0000 // Offsets for accessing CSRs.
+#define CH32_REGS_GPR 0x1000 // Offsets for accessing general-purpose (x)registers.
+
+#define CH32_CFGR_KEY   0x5aa50000
+#define CH32_CFGR_OUTEN (1 << 10)
+
+// The start of CH32 CODE FLASH region.
+#define CH32_CODE_BEGIN 0x08000000
+// the end of the CH32 CODE FLASH region.
+#define CH32_CODE_END   0x08004000
+
+// FLASH status register.
+#define CH32_FLASH_STATR 0x4002200C
+// FLASH configuration register.
+#define CH32_FLASH_CTLR  0x40022010
+// FLASH address register.
+#define CH32_FLASH_ADDR  0x40022014
+
+// FLASH is busy writing or erasing.
+#define CH32_FLASH_STATR_BUSY   (1 << 0)
+// FLASH is busy writing
+#define CH32_FLASH_STATR_WRBUSY (1 << 1)
+// FLASH is finished with the operation.
+#define CH32_FLASH_STATR_EOP    (1 << 5)
+
+// Perform standard programming operation.
+#define CH32_FLASH_CTLR_PG     (1 << 0)
+// Perform 1K sector erase.
+#define CH32_FLASH_CTLR_PER    (1 << 1)
+// Perform full FLASH erase.
+#define CH32_FLASH_CTLR_MER    (1 << 2)
+// Perform user-selected word program.
+#define CH32_FLASH_CTLR_OBG    (1 << 4)
+// Perform user-selected word erasure.
+#define CH32_FLASH_CTLR_OBER   (1 << 5)
+// Start an erase operation.
+#define CH32_FLASH_CTLR_STRT   (1 << 6)
+// Lock the FLASH.
+#define CH32_FLASH_CTLR_LOCK   (1 << 7)
+// Start a fast page programming operation (256 bytes).
+#define CH32_FLASH_CTLR_FTPG   (1 << 16)
+// Start a fast page erase operation (256 bytes).
+#define CH32_FLASH_CTLR_FTER   (1 << 17)
+// Start a page programming operation (256 bytes).
+#define CH32_FLASH_CTLR_PGSTRT (1 << 21)
+
+
+
+uint8_t const ch32_readmem[] = {0x88, 0x41, 0x02, 0x90};
+
+uint8_t const ch32_writemem[] = {0x88, 0xc1, 0x02, 0x90};
+
+rvswd_result_t ch32_halt_microprocessor(rvswd_handle_t *handle) {
+    rvswd_write(handle, CH32_REG_DEBUG_DMCONTROL, 0x80000001); // Make the debug module work properly
+    rvswd_write(handle, CH32_REG_DEBUG_DMCONTROL, 0x80000001); // Initiate a halt request
+
+    // Get the debug module status information, check rdata[9:8], if the value is 0b11,
+    // it means the processor enters the halt state normally. Otherwise try again.
+    uint8_t timeout = 5;
+    while (1) {
+        uint32_t value;
+        rvswd_read(handle, CH32_REG_DEBUG_DMSTATUS, &value);
+        if (((value >> 8) & 0b11) == 0b11) { // Check that processor has entered halted state
+            break;
+        }
+        if (timeout == 0) {
+            ESP_LOGE(TAG, "Failed to halt microprocessor, DMSTATUS=%" PRIx32, value);
+            return false;
+        }
+        timeout--;
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+
+    rvswd_write(handle, CH32_REG_DEBUG_DMCONTROL, 0x00000001); // Clear the halt request
+    ESP_LOGI(TAG, "Microprocessor halted");
+    return RVSWD_OK;
+}
+
+rvswd_result_t ch32_resume_microprocessor(rvswd_handle_t *handle) {
+    rvswd_write(handle, CH32_REG_DEBUG_DMCONTROL, 0x80000001); // Make the debug module work properly
+    rvswd_write(handle, CH32_REG_DEBUG_DMCONTROL, 0x80000001); // Initiate a halt request
+    rvswd_write(handle, CH32_REG_DEBUG_DMCONTROL, 0x00000001); // Clear the halt request
+    rvswd_write(handle, CH32_REG_DEBUG_DMCONTROL, 0x40000001); // Initiate a resume request
+
+    // Get the debug module status information, check rdata[17:16],
+    // if the value is 0b11, it means the processor has recovered.
+    uint8_t timeout = 5;
+    while (1) {
+        uint32_t value;
+        rvswd_read(handle, CH32_REG_DEBUG_DMSTATUS, &value);
+        if ((((value >> 10) & 0b11) == 0b11)) {
+            break;
+        }
+        if (timeout == 0) {
+            ESP_LOGE(TAG, "Failed to resume microprocessor, DMSTATUS=%" PRIx32, value);
+            return RVSWD_FAIL;
+        }
+        timeout--;
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+    return RVSWD_OK;
+}
+
+rvswd_result_t ch32_reset_microprocessor_and_run(rvswd_handle_t *handle) {
+    rvswd_write(handle, CH32_REG_DEBUG_DMCONTROL, 0x80000001); // Make the debug module work properly
+    rvswd_write(handle, CH32_REG_DEBUG_DMCONTROL, 0x80000001); // Initiate a halt request
+    rvswd_write(handle, CH32_REG_DEBUG_DMCONTROL, 0x00000001); // Clear the halt request
+    rvswd_write(handle, CH32_REG_DEBUG_DMCONTROL, 0x00000003); // Initiate a core reset request
+
+    uint8_t timeout = 5;
+    while (1) {
+        uint32_t value;
+        rvswd_read(handle, CH32_REG_DEBUG_DMSTATUS, &value);
+        if (((value >> 18) & 0b11) == 0b11) { // Check that processor has been reset
+            break;
+        }
+        if (timeout == 0) {
+            ESP_LOGE(TAG, "Failed to reset microprocessor");
+            return RVSWD_FAIL;
+        }
+        timeout--;
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+
+    rvswd_write(handle, CH32_REG_DEBUG_DMCONTROL, 0x00000001); // Clear the core reset request
+    vTaskDelay(pdMS_TO_TICKS(10));
+    rvswd_write(handle, CH32_REG_DEBUG_DMCONTROL, 0x10000001); // Clear the core reset status signal
+    vTaskDelay(pdMS_TO_TICKS(10));
+    rvswd_write(handle, CH32_REG_DEBUG_DMCONTROL, 0x00000001); // Clear the core reset status signal clear request
+    vTaskDelay(pdMS_TO_TICKS(10));
+
+    return RVSWD_OK;
+}
+
+bool ch32_write_cpu_reg(rvswd_handle_t *handle, uint16_t regno, uint32_t value) {
+    uint32_t command = regno        // Register to access.
+                       | (1 << 16)  // Write access.
+                       | (1 << 17)  // Perform transfer.
+                       | (2 << 20)  // 32-bit register access.
+                       | (0 << 24); // Access register command.
+
+    rvswd_write(handle, CH32_REG_DEBUG_DATA0, value);
+    rvswd_write(handle, CH32_REG_DEBUG_COMMAND, command);
+    return true;
+}
+
+bool ch32_read_cpu_reg(rvswd_handle_t *handle, uint16_t regno, uint32_t *value_out) {
+    uint32_t command = regno        // Register to access.
+                       | (0 << 16)  // Read access.
+                       | (1 << 17)  // Perform transfer.
+                       | (2 << 20)  // 32-bit register access.
+                       | (0 << 24); // Access register command.
+
+    rvswd_write(handle, CH32_REG_DEBUG_COMMAND, command);
+    rvswd_read(handle, CH32_REG_DEBUG_DATA0, value_out);
+    return true;
+}
+
+bool ch32_run_debug_code(rvswd_handle_t *handle, void const *code, size_t code_size) {
+    if (code_size > 8 * 4) {
+        ESP_LOGE(TAG, "Debug program is too long (%zd/%zd)", code_size, (size_t)8 * 4);
+        return false;
+    } else if (code_size & 1) {
+        ESP_LOGE(TAG, "Debug program size must be a multiple of 2 (%zd)", code_size);
+        return false;
+    }
+
+    // Copy into program buffer.
+    uint32_t tmp[8] = {0};
+    memcpy(tmp, code, code_size);
+    for (size_t i = 0; i < 8; i++) {
+        rvswd_write(handle, CH32_REG_DEBUG_PROGBUF0 + i, tmp[i]);
+    }
+
+    // Run program buffer.
+    uint32_t command = (0 << 17)    // Do not perform transfer.
+                       | (1 << 18)  // Run program buffer afterwards.
+                       | (2 << 20)  // 32-bit register access.
+                       | (0 << 24); // Access register command.
+    rvswd_write(handle, CH32_REG_DEBUG_COMMAND, command);
+
+    return true;
+}
+
+bool ch32_read_memory_word(rvswd_handle_t *handle, uint32_t address, uint32_t *value_out) {
+    ch32_write_cpu_reg(handle, CH32_REGS_GPR + 11, address);
+    ch32_run_debug_code(handle, ch32_readmem, sizeof(ch32_readmem));
+    ch32_read_cpu_reg(handle, CH32_REGS_GPR + 10, value_out);
+    return true;
+}
+
+bool ch32_write_memory_word(rvswd_handle_t *handle, uint32_t address, uint32_t value) {
+    ch32_write_cpu_reg(handle, CH32_REGS_GPR + 10, value);
+    ch32_write_cpu_reg(handle, CH32_REGS_GPR + 11, address);
+    ch32_run_debug_code(handle, ch32_writemem, sizeof(ch32_writemem));
+    return true;
+}
+
+// Wait for the FLASH chip to finish its current operation.
+static void ch32_wait_flash(rvswd_handle_t *handle) {
+    uint32_t value = 0;
+    ch32_read_memory_word(handle, CH32_FLASH_STATR, &value);
+
+    while (value & CH32_FLASH_STATR_BUSY) {
+        vTaskDelay(1);
+        ch32_read_memory_word(handle, CH32_FLASH_STATR, &value);
+    }
+}
+
+static void ch32_wait_flash_write(rvswd_handle_t *handle) {
+    uint32_t value = 0;
+    ch32_read_memory_word(handle, CH32_FLASH_STATR, &value);
+    while (value & CH32_FLASH_STATR_WRBUSY) {
+        ch32_read_memory_word(handle, CH32_FLASH_STATR, &value);
+    }
+}
+
+// Unlock the FLASH if not already unlocked.
+bool ch32_unlock_flash(rvswd_handle_t *handle) {
+    uint32_t ctlr;
+    ch32_read_memory_word(handle, CH32_FLASH_CTLR, &ctlr);
+
+    printf("CTLR before unlock: %08" PRIx32 "\r\n", ctlr);
+
+    /*if (!(ctlr & 0x8080)) {
+        // FLASH already unlocked.
+        printf("Already unlocked\r\n");
+        return true;
+    }*/
+
+    // Enter the unlock keys.
+    ch32_write_memory_word(handle, 0x40022004, 0x45670123);
+    ch32_write_memory_word(handle, 0x40022004, 0xCDEF89AB);
+    ch32_write_memory_word(handle, 0x40022008, 0x45670123);
+    ch32_write_memory_word(handle, 0x40022008, 0xCDEF89AB);
+    ch32_write_memory_word(handle, 0x40022024, 0x45670123);
+    ch32_write_memory_word(handle, 0x40022024, 0xCDEF89AB);
+
+    // Check again if FLASH is unlocked.
+    ch32_read_memory_word(handle, CH32_FLASH_CTLR, &ctlr);
+
+    printf("CTLR after unlock: %08" PRIx32 "\r\n", ctlr);
+
+    return !(ctlr & 0x8080);
+}
+
+// If unlocked: Erase a 256-byte block of FLASH.
+bool ch32_erase_flash_block(rvswd_handle_t *handle, uint32_t addr) {
+    if (addr % 256)
+        return false;
+    ch32_wait_flash(handle);
+    ch32_write_memory_word(handle, CH32_FLASH_CTLR, CH32_FLASH_CTLR_FTER);
+    ch32_write_memory_word(handle, CH32_FLASH_ADDR, addr);
+    ch32_write_memory_word(handle, CH32_FLASH_CTLR, CH32_FLASH_CTLR_FTER | CH32_FLASH_CTLR_STRT);
+    ch32_wait_flash(handle);
+    ch32_write_memory_word(handle, CH32_FLASH_CTLR, 0);
+    return true;
+}
+
+// If unlocked: Write a 256-byte block of FLASH.
+bool ch32_write_flash_block(rvswd_handle_t *handle, uint32_t addr, void const *data) {
+    if (addr % 256)
+        return false;
+
+    ch32_wait_flash(handle);
+    ch32_write_memory_word(handle, CH32_FLASH_CTLR, CH32_FLASH_CTLR_FTPG);
+
+    ch32_write_memory_word(handle, CH32_FLASH_ADDR, addr);
+
+    uint32_t wdata[64];
+    memcpy(wdata, data, sizeof(wdata));
+    for (size_t i = 0; i < 64; i++) {
+        ch32_write_memory_word(handle, addr + i * 4, wdata[i]);
+        ch32_wait_flash_write(handle);
+    }
+
+    ch32_write_memory_word(handle, CH32_FLASH_CTLR, CH32_FLASH_CTLR_FTPG | CH32_FLASH_CTLR_PGSTRT);
+    ch32_wait_flash(handle);
+    ch32_write_memory_word(handle, CH32_FLASH_CTLR, 0);
+    vTaskDelay(1);
+
+    uint32_t rdata[64];
+    for (size_t i = 0; i < 64; i++) {
+        vTaskDelay(0);
+        ch32_read_memory_word(handle, addr + i * 4, &rdata[i]);
+    }
+    if (memcmp(wdata, rdata, sizeof(wdata))) {
+        ESP_LOGE(TAG, "Write block mismatch at %08" PRIx32, addr);
+        ESP_LOGE(TAG, "Write:");
+        for (size_t i = 0; i < 64; i++) {
+            ESP_LOGE(TAG, "%zx: %08" PRIx32, i, wdata[i]);
+        }
+        ESP_LOGE(TAG, "Read:");
+        for (size_t i = 0; i < 64; i++) {
+            ESP_LOGE(TAG, "%zx: %08" PRIx32, i, rdata[i]);
+        }
+        return false;
+    }
+
+    return true;
+}
+
+// If unlocked: Erase and write a range of FLASH memory.
+bool ch32_write_flash(rvswd_handle_t *handle, uint32_t addr, void const *_data, size_t data_len) {
+    if (addr % 64) {
+        return false;
+    }
+
+    uint8_t const *data = _data;
+
+    char buffer[256];
+
+    for (size_t i = 0; i < data_len; i += 256) {
+        vTaskDelay(0);
+        sprintf(buffer, "Erasing 0x%08" PRIx32 "...\r\n", addr + i);
+        printf("%s", buffer);
+        draw_text(buffer);
+        if (!ch32_erase_flash_block(handle, addr + i)) {
+            ESP_LOGE(TAG, "Error: Failed to erase FLASH at %08" PRIx32, addr + i);
+            return false;
+        }
+
+        sprintf(buffer, "Writing 0x%08" PRIx32 "...\r\n", addr + i);
+        printf("%s", buffer);
+        draw_text(buffer);
+        if (!ch32_write_flash_block(handle, addr + i, data + i)) {
+            ESP_LOGE(TAG, "Error: Failed to write FLASH at %08" PRIx32, addr + i);
+            return false;
+        }
+    }
+
+    return true;
+}
+
+void rvswd_test(void) {
+    rvswd_result_t res;
+
+    rvswd_handle_t handle = {
+        .swdio = 22,
+        .swclk = 23,
+    };
+
+    res = rvswd_init(&handle);
+
+    draw_text("Initializing RVSWD...");
+
+    if (res != RVSWD_OK) {
+        draw_text("Failed to initialize");
+        ESP_LOGE(TAG, "Init error %u!", res);
+        return;
+    }
+
+    draw_text("Reset RVSWD...");
+    res = rvswd_reset(&handle);
+
+    if (res != RVSWD_OK) {
+        draw_text("Failed to reset");
+        ESP_LOGE(TAG, "Reset error %u!", res);
+        return;
+    }
+
+    draw_text("Halt coprocessor...");
+    res = ch32_halt_microprocessor(&handle);
+    if (res != RVSWD_OK) {
+        draw_text("Failed to halt");
+        ESP_LOGE(TAG, "Failed to halt");
+        return;
+    }
+
+    bool bool_res = ch32_unlock_flash(&handle);
+
+    printf("Unlock: %s\r\n", bool_res ? "yes" : "no");
+
+    if (!bool_res) {
+        draw_text("Failed to unlock");
+        ESP_LOGE(TAG, "Failed to unlock");
+        return;
+    }
+
+    draw_text("Flashing coprocessor...");
+    bool_res = ch32_write_flash(&handle, 0x08000000, ch32_firmware_start, ch32_firmware_end - ch32_firmware_start);
+    if (!bool_res) {
+        draw_text("Failed to flash");
+        ESP_LOGE(TAG, "Failed to write flash");
+        return;
+    }
+
+    draw_text("Booting coprocessor...");
+    res = ch32_reset_microprocessor_and_run(&handle);
+    if (res != RVSWD_OK) {
+        draw_text("Failed to boot");
+        ESP_LOGE(TAG, "Failed to reset and run");
+        return;
+    }
+
+    draw_text("Coprocessor ready!");
+
+    ESP_LOGI(TAG, "Okay!");
+
+    /*while (1) {
+
+        // Halt
+        rvswd_write(&handle, 0x10, 0x80000001);
+        rvswd_write(&handle, 0x10, 0x80000001);
+
+        // Read status
+        uint32_t value = 0;
+        res = rvswd_read(&handle, 0x11, &value);
+        if (res == RVSWD_OK) {
+            printf("Status after halt: %08" PRIx32 "\n", value);
+        } else {
+            ESP_LOGE(TAG, "Status error %u!", res);
+        }
+
+        // Dump some memory
+
+        for (uint32_t address = 0x0; address < 0x10; address++) {
+            uint32_t value = 0;
+            ch32_read_memory_word(&handle, address, &value);
+            printf("0x%08" PRIx32 "  0x%08" PRIx32 "\r\n", address, value);
+        }
+        printf("\r\n");
+
+        // Resume
+        rvswd_write(&handle, 0x10, 0x40000001);
+        rvswd_write(&handle, 0x10, 0x40000001);
+
+        // Read status
+        value = 0;
+        res = rvswd_read(&handle, 0x11, &value);
+        if (res == RVSWD_OK) {
+            printf("Status after resume: %08" PRIx32 "\n", value);
+        } else {
+            ESP_LOGE(TAG, "Status error %u!", res);
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }*/
+}
