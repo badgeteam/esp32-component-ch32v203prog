@@ -1,14 +1,16 @@
 
+/**
+ * Copyright (c) 2024 Nicolai Electronics
+ *
+ * SPDX-License-Identifier: MIT
+ */
+
+#include "ch32v203prog.h"
+
 #include "esp_log.h"
-#include "rvswd.h"
 #include "string.h"
 
-static char const TAG[] = "ch32test";
-
-extern void draw_text(char const *text);
-
-extern uint8_t const ch32_firmware_start[] asm("_binary_ch32_firmware_bin_start");
-extern uint8_t const ch32_firmware_end[] asm("_binary_ch32_firmware_bin_end");
+static char const TAG[] = "ch32v203prog";
 
 
 #define CH32_REG_DEBUG_DATA0        0x04 // Data register 0, can be used for temporary storage of data
@@ -342,21 +344,18 @@ bool ch32_write_flash(rvswd_handle_t *handle, uint32_t addr, void const *_data, 
 
     uint8_t const *data = _data;
 
-    char buffer[256];
+    char buffer[32];
 
     for (size_t i = 0; i < data_len; i += 256) {
         vTaskDelay(0);
-        sprintf(buffer, "Erasing 0x%08" PRIx32 "...\r\n", addr + i);
-        printf("%s", buffer);
-        draw_text(buffer);
+        snprintf(buffer, sizeof(buffer) - 1, "Writing at 0x%08" PRIx32, addr + i);
+        ch32_status_callback(buffer, i, data_len);
+
         if (!ch32_erase_flash_block(handle, addr + i)) {
             ESP_LOGE(TAG, "Error: Failed to erase FLASH at %08" PRIx32, addr + i);
             return false;
         }
 
-        sprintf(buffer, "Writing 0x%08" PRIx32 "...\r\n", addr + i);
-        printf("%s", buffer);
-        draw_text(buffer);
         if (!ch32_write_flash_block(handle, addr + i, data + i)) {
             ESP_LOGE(TAG, "Error: Failed to write FLASH at %08" PRIx32, addr + i);
             return false;
@@ -366,108 +365,54 @@ bool ch32_write_flash(rvswd_handle_t *handle, uint32_t addr, void const *_data, 
     return true;
 }
 
-void rvswd_test(void) {
+// Program and restart the CH32V203.
+void ch32_program(rvswd_handle_t *handle, void const *firmware, size_t firmware_len) {
     rvswd_result_t res;
 
-    rvswd_handle_t handle = {
-        .swdio = 22,
-        .swclk = 23,
-    };
-
-    res = rvswd_init(&handle);
-
-    draw_text("Initializing RVSWD...");
+    res = rvswd_init(handle);
 
     if (res != RVSWD_OK) {
-        draw_text("Failed to initialize");
         ESP_LOGE(TAG, "Init error %u!", res);
         return;
     }
 
-    draw_text("Reset RVSWD...");
-    res = rvswd_reset(&handle);
+    res = rvswd_reset(handle);
 
     if (res != RVSWD_OK) {
-        draw_text("Failed to reset");
         ESP_LOGE(TAG, "Reset error %u!", res);
         return;
     }
 
-    draw_text("Halt coprocessor...");
-    res = ch32_halt_microprocessor(&handle);
+    res = ch32_halt_microprocessor(handle);
     if (res != RVSWD_OK) {
-        draw_text("Failed to halt");
         ESP_LOGE(TAG, "Failed to halt");
         return;
     }
 
-    bool bool_res = ch32_unlock_flash(&handle);
+    bool bool_res = ch32_unlock_flash(handle);
 
     printf("Unlock: %s\r\n", bool_res ? "yes" : "no");
 
     if (!bool_res) {
-        draw_text("Failed to unlock");
         ESP_LOGE(TAG, "Failed to unlock");
         return;
     }
 
-    draw_text("Flashing coprocessor...");
-    bool_res = ch32_write_flash(&handle, 0x08000000, ch32_firmware_start, ch32_firmware_end - ch32_firmware_start);
+    bool_res = ch32_write_flash(handle, 0x08000000, firmware, firmware_len);
     if (!bool_res) {
-        draw_text("Failed to flash");
         ESP_LOGE(TAG, "Failed to write flash");
         return;
-    }
-
-    draw_text("Booting coprocessor...");
-    res = ch32_reset_microprocessor_and_run(&handle);
+    };
+    res = ch32_reset_microprocessor_and_run(handle);
     if (res != RVSWD_OK) {
-        draw_text("Failed to boot");
         ESP_LOGE(TAG, "Failed to reset and run");
         return;
     }
 
-    draw_text("Coprocessor ready!");
-
     ESP_LOGI(TAG, "Okay!");
+}
 
-    /*while (1) {
-
-        // Halt
-        rvswd_write(&handle, 0x10, 0x80000001);
-        rvswd_write(&handle, 0x10, 0x80000001);
-
-        // Read status
-        uint32_t value = 0;
-        res = rvswd_read(&handle, 0x11, &value);
-        if (res == RVSWD_OK) {
-            printf("Status after halt: %08" PRIx32 "\n", value);
-        } else {
-            ESP_LOGE(TAG, "Status error %u!", res);
-        }
-
-        // Dump some memory
-
-        for (uint32_t address = 0x0; address < 0x10; address++) {
-            uint32_t value = 0;
-            ch32_read_memory_word(&handle, address, &value);
-            printf("0x%08" PRIx32 "  0x%08" PRIx32 "\r\n", address, value);
-        }
-        printf("\r\n");
-
-        // Resume
-        rvswd_write(&handle, 0x10, 0x40000001);
-        rvswd_write(&handle, 0x10, 0x40000001);
-
-        // Read status
-        value = 0;
-        res = rvswd_read(&handle, 0x11, &value);
-        if (res == RVSWD_OK) {
-            printf("Status after resume: %08" PRIx32 "\n", value);
-        } else {
-            ESP_LOGE(TAG, "Status error %u!", res);
-        }
-
-        vTaskDelay(pdMS_TO_TICKS(1000));
-    }*/
+// Default status callback implementation.
+void __attribute__((weak)) ch32_status_callback(char const *msg, int progress, int total) {
+    ESP_LOGI(TAG, "%s: %d%% (%d/%d)", msg, progress * 100 / total, progress, total);
 }

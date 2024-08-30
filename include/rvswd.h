@@ -1,3 +1,4 @@
+
 /**
  * Copyright (c) 2024 Nicolai Electronics
  *
@@ -21,7 +22,6 @@ typedef enum rvswd_result {
     RVSWD_FAIL         = 1,
     RVSWD_INVALID_ARGS = 2,
     RVSWD_PARITY_ERROR = 3,
-
 } rvswd_result_t;
 
 rvswd_result_t rvswd_init(rvswd_handle_t *handle);
